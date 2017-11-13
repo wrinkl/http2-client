@@ -185,9 +185,9 @@ client QueryArgs{..} = do
     parentThread <- myThreadId
     let withConn = case _verboseDebug of
             Verbose ->
-                runHttp2Client wrappedFrameConn _encoderBufsize _decoderBufsize conf defaultGoAwayHandler printUnhandledFrame
+                runHttp2Client wrappedFrameConn _encoderBufsize _decoderBufsize conf defaultGoAwayHandler defaultEndOfStreamHandler printUnhandledFrame
             NonVerbose ->
-                runHttp2Client frameConn _encoderBufsize _decoderBufsize conf (throwTo parentThread) ignoreFallbackHandler
+                runHttp2Client frameConn _encoderBufsize _decoderBufsize conf (throwTo parentThread) (throwTo parentThread) ignoreFallbackHandler
 
     withConn $ \conn -> do
       linkAsyncs conn

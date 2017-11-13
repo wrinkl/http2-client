@@ -9,6 +9,7 @@ import qualified Data.IntMap as IntMap
 import           GHC.Exception (Exception)
 import           Network.HPACK as HPACK
 import           Network.HTTP2 as HTTP2
+import           System.IO.Error (IOError)
 
 import           Network.HTTP2.Client.Channels
 
@@ -42,6 +43,13 @@ type GoAwayHandler = RemoteSentGoAwayFrame -> IO ()
 defaultGoAwayHandler :: GoAwayHandler
 defaultGoAwayHandler = throwIO
 
+-- | A more-specific Handler for exceptional circumstances (when the stream
+-- gets closed).
+type EndOfStreamHandler = IOError -> IO ()
+
+defaultEndOfStreamHandler :: EndOfStreamHandler
+defaultEndOfStreamHandler = throwIO
+
 data StreamFSMState =
     Idle
   | ReservedRemote
@@ -61,10 +69,11 @@ data StreamState = StreamState {
 data Dispatch = Dispatch {
     _dispatchMaxStreamId    :: !(IORef StreamId)
   , _dispatchCurrentStreams :: !(IORef (IntMap StreamState))
+  , _dispatchOnEndOfStream  :: EndOfStreamHandler
   }
 
-newDispatchIO :: IO Dispatch
-newDispatchIO = Dispatch <$> newIORef 0 <*> newIORef (IntMap.empty)
+newDispatchIO :: EndOfStreamHandler -> IO Dispatch
+newDispatchIO onEos = Dispatch <$> newIORef 0 <*> newIORef (IntMap.empty) <*> pure onEos
 
 readMaxReceivedStreamIdIO :: Dispatch -> IO StreamId
 readMaxReceivedStreamIdIO = readIORef . _dispatchMaxStreamId

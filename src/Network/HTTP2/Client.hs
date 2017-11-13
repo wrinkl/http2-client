@@ -30,6 +30,8 @@ module Network.HTTP2.Client (
     , RemoteSentGoAwayFrame(..)
     , GoAwayHandler
     , defaultGoAwayHandler
+    , EndOfStreamHandler
+    , defaultEndOfStreamHandler
     -- * Misc.
     , FallBackFrameHandler
     , ignoreFallbackHandler
@@ -55,6 +57,7 @@ import           Network.HPACK as HPACK
 import           Network.HTTP2 as HTTP2
 import           Network.Socket (HostName, PortNumber)
 import           Network.TLS (ClientParams)
+import           System.IO.Error (ioError, catchIOError, isEOFError)
 
 import           Network.HTTP2.Client.Channels
 import           Network.HTTP2.Client.Dispatch
@@ -318,14 +321,16 @@ runHttp2Client
   -- ^ Initial SETTINGS that are sent as first frame.
   -> GoAwayHandler
   -- ^ Actions to run when the remote sends a GoAwayFrame
+  -> EndOfStreamHandler
+  -- ^ Actions to run when the remote kills the network.
   -> FallBackFrameHandler
   -- ^ Actions to run when a control frame is not yet handled in http2-client
   -- lib (e.g., PRIORITY frames).
   -> (Http2Client -> IO a)
   -- ^ Actions to run on the client.
   -> IO a
-runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fallbackHandler mainHandler = do
-    (incomingLoop, initClient) <- initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
+runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler eosHandler fallbackHandler mainHandler = do
+    (incomingLoop, initClient) <- initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler eosHandler fallbackHandler
     withAsync incomingLoop $ \aIncoming -> do
         settsIO <- _initSettings initClient initSettings
         withAsync settsIO $ \aSettings -> do
@@ -355,13 +360,15 @@ newHttp2Client
   -> SettingsList
   -- ^ Initial SETTINGS that are sent as first frame.
   -> GoAwayHandler
-  -- ^ Actions to run when the remote sends a GoAwayFrame
+  -- ^ Actions to run when the remote sends a GoAwayFrame.
+  -> EndOfStreamHandler
+  -- ^ Actions to run when the remote kills the network.
   -> FallBackFrameHandler
   -- ^ Actions to run when a control frame is not yet handled in http2-client
   -- lib (e.g., PRIORITY frames).
   -> IO Http2Client
-newHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fallbackHandler = do
-    (incomingLoop, initClient) <- initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
+newHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler eosHandler fallbackHandler = do
+    (incomingLoop, initClient) <- initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler eosHandler fallbackHandler
     aIncoming <- async incomingLoop
     settsIO <- _initSettings initClient initSettings
     aSettings <- async settsIO
@@ -382,15 +389,16 @@ initHttp2Client
   -> Int
   -> Int
   -> GoAwayHandler
+  -> EndOfStreamHandler
   -> FallBackFrameHandler
   -> IO (IO (), InitHttp2Client)
-initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler = do
+initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler eosHandler fallbackHandler = do
     let controlStream = makeFrameClientStream conn 0
     let ackPing = sendPingFrame controlStream HTTP2.setAck
     let ackSettings = sendSettingsFrame controlStream HTTP2.setAck []
 
     {- Setup for initial thread receiving server frames. -}
-    dispatch  <- newDispatchIO
+    dispatch  <- newDispatchIO eosHandler
     dispatchControl <- newDispatchControlIO encoderBufSize
                                             ackPing
                                             ackSettings
@@ -531,36 +539,46 @@ dispatchLoop
   -> DispatchHPACK
   -> IO ()
 dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
-    let getNextFrame = next conn
-    delayException . forever $ do
-        frame <- getNextFrame
-        dispatchFramesStep frame d
-        whenFrame (hasStreamId 0) frame $ \got ->
-            dispatchControlFramesStep windowUpdatesChan got dc
-        whenFrame (hasTypeId [FrameData]) frame $ \got ->
-            creditDataFramesStep inFlowControl got
-        whenFrame (hasTypeId [FrameWindowUpdate]) frame $ \got -> do
-            updateWindowsStep d got
-        whenFrame (hasTypeId [FrameRSTStream, FramePushPromise, FrameHeaders]) frame $ \got -> do
-            let hpackLoop (FinishedWithHeaders curFh sId mkNewHdrs) = do
-                    newHdrs <- mkNewHdrs
-                    chan <- fmap _streamStateHeadersChan <$> lookupStreamState d sId
-                    let msg = (curFh, sId, Right newHdrs)
-                    maybe (return ()) (flip writeChan msg) chan
-                hpackLoop (FinishedWithPushPromise _ parentSid newSid mkNewHdrs) = do
-                    newHdrs <- mkNewHdrs
-                    chan <- fmap _streamStatePushPromisesChan <$> lookupStreamState d parentSid
-                    let msg = (parentSid, newSid, newHdrs)
-                    maybe (return ()) (flip writeChan msg) (join chan)
-                hpackLoop (WaitContinuation act)        =
-                    getNextFrame >>= act >>= hpackLoop
-                hpackLoop (FailedHeaders curFh sId err)        = do
-                    chan <- fmap _streamStateHeadersChan <$> lookupStreamState d sId
-                    let msg = (curFh, sId, Left err)
-                    maybe (return ()) (flip writeChan msg) chan
-            hpackLoop (dispatchHPACKFramesStep got dh)
-        whenFrame (hasTypeId [FrameRSTStream]) frame $ \got -> do
-            closeReleaseStream d $ streamId $ fst got
+    let getNextFrame = (fmap Right $ next conn)
+            `catchIOError` (\e -> if isEOFError e then return (Left e) else ioError e)
+    delayException $ forever $ do
+       frameE <- getNextFrame
+       case frameE of
+           Left e ->
+               _dispatchOnEndOfStream d e
+           Right frame -> do
+               dispatchFramesStep frame d
+               whenFrame (hasStreamId 0) frame $ \got ->
+                   dispatchControlFramesStep windowUpdatesChan got dc
+               whenFrame (hasTypeId [FrameData]) frame $ \got ->
+                   creditDataFramesStep inFlowControl got
+               whenFrame (hasTypeId [FrameWindowUpdate]) frame $ \got -> do
+                   updateWindowsStep d got
+               whenFrame (hasTypeId [FrameRSTStream, FramePushPromise, FrameHeaders]) frame $ \got -> do
+                   let hpackLoop (FinishedWithHeaders curFh sId mkNewHdrs) = do
+                           newHdrs <- mkNewHdrs
+                           chan <- fmap _streamStateHeadersChan <$> lookupStreamState d sId
+                           let msg = (curFh, sId, Right newHdrs)
+                           maybe (return ()) (flip writeChan msg) chan
+                       hpackLoop (FinishedWithPushPromise _ parentSid newSid mkNewHdrs) = do
+                           newHdrs <- mkNewHdrs
+                           chan <- fmap _streamStatePushPromisesChan <$> lookupStreamState d parentSid
+                           let msg = (parentSid, newSid, newHdrs)
+                           maybe (return ()) (flip writeChan msg) (join chan)
+                       hpackLoop (WaitContinuation act)        = do
+                           cFrameE <- getNextFrame
+                           case cFrameE of
+                               Right cframe ->
+                                   act cframe >>= hpackLoop
+                               Left e ->
+                                   _dispatchOnEndOfStream d e
+                       hpackLoop (FailedHeaders curFh sId err)        = do
+                           chan <- fmap _streamStateHeadersChan <$> lookupStreamState d sId
+                           let msg = (curFh, sId, Left err)
+                           maybe (return ()) (flip writeChan msg) chan
+                   hpackLoop (dispatchHPACKFramesStep got dh)
+               whenFrame (hasTypeId [FrameRSTStream]) frame $ \got -> do
+                   closeReleaseStream d $ streamId $ fst got
 
 dispatchFramesStep
   :: (FrameHeader, Either HTTP2Error FramePayload)
